@@ -1,0 +1,8 @@
+[package]
+name = "veea"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fs_extra = "1.3.0"
+xcap = "0.8.1"
