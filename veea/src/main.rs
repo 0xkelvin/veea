@@ -163,8 +163,25 @@ fn run() -> AppResult<()> {
     Ok(())
 }
 
+fn test_capture() -> AppResult<()> {
+    println!("=== Veea Capture Test Mode ===");
+    let config = CaptureConfig::load_or_init(Path::new(DEFAULT_CONFIG_PATH))?;
+    let db = db::Db::new(&config.db_path)?;
+    let pause_flag = Arc::new(AtomicBool::new(false));
+    let engine = CaptureEngine::new(config, db, pause_flag)?;
+    engine.test_capture()
+}
+
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("Fatal error: {e}");
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "test" {
+        if let Err(e) = test_capture() {
+            eprintln!("Test failed: {e}");
+            std::process::exit(1);
+        }
+    } else {
+        if let Err(e) = run() {
+            eprintln!("Fatal error: {e}");
+        }
     }
 }
