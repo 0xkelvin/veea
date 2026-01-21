@@ -1,0 +1,4 @@
+/ {
+	model = "Veea Device";
+	compatible = "veea,device";
+};
