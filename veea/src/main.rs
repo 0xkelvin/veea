@@ -172,11 +172,28 @@ fn test_capture() -> AppResult<()> {
     engine.test_capture()
 }
 
+fn snapshot_once(label: &str) -> AppResult<()> {
+    println!("=== Veea Snapshot Mode ===");
+    let config = CaptureConfig::load_or_init(Path::new(DEFAULT_CONFIG_PATH))?;
+    let db = db::Db::new(&config.db_path)?;
+    let pause_flag = Arc::new(AtomicBool::new(false));
+    let mut engine = CaptureEngine::new(config, db, pause_flag)?;
+    let path = engine.snapshot_png(label)?;
+    println!("Snapshot saved: {}", path.display());
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 && args[1] == "test" {
         if let Err(e) = test_capture() {
             eprintln!("Test failed: {e}");
+            std::process::exit(1);
+        }
+    } else if args.len() > 1 && args[1] == "snapshot" {
+        let label = args.get(2).map(String::as_str).unwrap_or("manual");
+        if let Err(e) = snapshot_once(label) {
+            eprintln!("Snapshot failed: {e}");
             std::process::exit(1);
         }
     } else {
