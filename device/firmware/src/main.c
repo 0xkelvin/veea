@@ -5,6 +5,7 @@
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/video.h>
+#include <zephyr/drivers/i2c.h>
 #include <zephyr/fs/fs.h>
 #include <zephyr/storage/disk_access.h>
 #include <ff.h>
@@ -30,6 +31,59 @@ static struct fs_mount_t sd_mount = {
 	.fs_data = &fat_fs,
 	.mnt_point = DISK_MOUNT_PT,
 };
+
+static bool ov2640_detected_on_bus(const struct device *i2c, const char *bus_name)
+{
+	uint8_t reg;
+	uint8_t pid = 0;
+	uint8_t ver = 0;
+	int ret;
+
+	if (!device_is_ready(i2c)) {
+		printk("%s not ready\n", bus_name);
+		return false;
+	}
+
+	k_sleep(K_MSEC(50));
+
+	reg = 0x0A;
+	ret = i2c_write_read(i2c, 0x30, &reg, sizeof(reg), &pid, sizeof(pid));
+	if (ret != 0) {
+		printk("%s OV2640 ID read failed (%d)\n", bus_name, ret);
+		return false;
+	}
+
+	reg = 0x0B;
+	ret = i2c_write_read(i2c, 0x30, &reg, sizeof(reg), &ver, sizeof(ver));
+	if (ret != 0) {
+		printk("%s OV2640 VER read failed (%d)\n", bus_name, ret);
+		return false;
+	}
+
+	if ((pid == 0x00 && ver == 0x00) || (pid == 0xFF && ver == 0xFF)) {
+		printk("%s OV2640 invalid ID (PID 0x%02x VER 0x%02x)\n",
+		       bus_name, pid, ver);
+		return false;
+	}
+
+	printk("%s OV2640 detected (PID 0x%02x VER 0x%02x)\n", bus_name, pid, ver);
+	return true;
+}
+
+static bool ov2640_detected(void)
+{
+	const struct device *i2c1 = DEVICE_DT_GET(DT_NODELABEL(i2c1));
+	const struct device *i2c0 = DEVICE_DT_GET(DT_NODELABEL(i2c0));
+
+	if (ov2640_detected_on_bus(i2c1, "I2C1")) {
+		return true;
+	}
+	if (ov2640_detected_on_bus(i2c0, "I2C0")) {
+		printk("OV2640 responds on I2C0; update devicetree if needed.\n");
+		return true;
+	}
+	return false;
+}
 
 static uint32_t crc32_init(void)
 {
@@ -307,6 +361,147 @@ static int png_write_rgb565(struct fs_file_t *file, const uint8_t *rgb565,
 	return png_write_chunk(file, "IEND", NULL, 0);
 }
 
+static inline uint8_t clamp_u8(int value)
+{
+	if (value < 0) {
+		return 0;
+	}
+	if (value > 255) {
+		return 255;
+	}
+	return (uint8_t)value;
+}
+
+static int png_write_yuyv(struct fs_file_t *file, const uint8_t *yuyv,
+			  uint32_t width, uint32_t height, uint32_t pitch)
+{
+	static const uint8_t signature[8] = {
+		0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A
+	};
+	uint8_t ihdr[13];
+	uint32_t row_size = (width * 3U) + 1U;
+	uint32_t data_len = row_size * height;
+	uint32_t block_count = (data_len + PNG_BLOCK_SIZE - 1U) / PNG_BLOCK_SIZE;
+	uint32_t zlib_len = 2U + data_len + (block_count * 5U) + 4U;
+	uint32_t crc;
+	int ret;
+
+	ret = fs_write_all(file, signature, sizeof(signature));
+	if (ret != 0) {
+		return ret;
+	}
+
+	ihdr[0] = (width >> 24) & 0xFF;
+	ihdr[1] = (width >> 16) & 0xFF;
+	ihdr[2] = (width >> 8) & 0xFF;
+	ihdr[3] = width & 0xFF;
+	ihdr[4] = (height >> 24) & 0xFF;
+	ihdr[5] = (height >> 16) & 0xFF;
+	ihdr[6] = (height >> 8) & 0xFF;
+	ihdr[7] = height & 0xFF;
+	ihdr[8] = 8; /* bit depth */
+	ihdr[9] = 2; /* color type: truecolor */
+	ihdr[10] = 0; /* compression */
+	ihdr[11] = 0; /* filter */
+	ihdr[12] = 0; /* interlace */
+
+	ret = png_write_chunk(file, "IHDR", ihdr, sizeof(ihdr));
+	if (ret != 0) {
+		return ret;
+	}
+
+	ret = png_write_u32_be(file, zlib_len);
+	if (ret != 0) {
+		return ret;
+	}
+
+	ret = fs_write_all(file, (const uint8_t *)"IDAT", 4);
+	if (ret != 0) {
+		return ret;
+	}
+
+	crc = crc32_update(crc32_init(), (const uint8_t *)"IDAT", 4);
+
+	struct zlib_writer zw = {
+		.file = file,
+		.remaining = data_len,
+		.block_remaining = 0,
+		.adler = 1U,
+		.crc = crc,
+	};
+	const uint8_t zhdr[2] = { 0x78, 0x01 };
+
+	ret = fs_write_all(file, zhdr, sizeof(zhdr));
+	if (ret != 0) {
+		return ret;
+	}
+	zw.crc = crc32_update(zw.crc, zhdr, sizeof(zhdr));
+
+	uint8_t *row_buf = k_malloc(1 + (width * 3U));
+	if (row_buf == NULL) {
+		return -ENOMEM;
+	}
+
+	for (uint32_t y = 0; y < height; y++) {
+		const uint8_t *row = yuyv + (y * pitch);
+		row_buf[0] = 0;
+
+		for (uint32_t x = 0; x < width; x += 2) {
+			uint8_t y0 = row[(x * 2) + 0];
+			uint8_t u = row[(x * 2) + 1];
+			uint8_t y1 = row[(x * 2) + 2];
+			uint8_t v = row[(x * 2) + 3];
+
+			int c0 = (int)y0 - 16;
+			int c1 = (int)y1 - 16;
+			int d = (int)u - 128;
+			int e = (int)v - 128;
+
+			int r0 = (298 * c0 + 409 * e + 128) >> 8;
+			int g0 = (298 * c0 - 100 * d - 208 * e + 128) >> 8;
+			int b0 = (298 * c0 + 516 * d + 128) >> 8;
+			row_buf[1 + (x * 3) + 0] = clamp_u8(r0);
+			row_buf[1 + (x * 3) + 1] = clamp_u8(g0);
+			row_buf[1 + (x * 3) + 2] = clamp_u8(b0);
+
+			if (x + 1 < width) {
+				int r1 = (298 * c1 + 409 * e + 128) >> 8;
+				int g1 = (298 * c1 - 100 * d - 208 * e + 128) >> 8;
+				int b1 = (298 * c1 + 516 * d + 128) >> 8;
+				row_buf[1 + ((x + 1) * 3) + 0] = clamp_u8(r1);
+				row_buf[1 + ((x + 1) * 3) + 1] = clamp_u8(g1);
+				row_buf[1 + ((x + 1) * 3) + 2] = clamp_u8(b1);
+			}
+		}
+
+		ret = zlib_write_data(&zw, row_buf, 1 + (width * 3U));
+		if (ret != 0) {
+			k_free(row_buf);
+			return ret;
+		}
+	}
+	k_free(row_buf);
+
+	uint8_t adler_be[4] = {
+		(uint8_t)(zw.adler >> 24),
+		(uint8_t)(zw.adler >> 16),
+		(uint8_t)(zw.adler >> 8),
+		(uint8_t)zw.adler,
+	};
+	ret = fs_write_all(file, adler_be, sizeof(adler_be));
+	if (ret != 0) {
+		return ret;
+	}
+	zw.crc = crc32_update(zw.crc, adler_be, sizeof(adler_be));
+
+	ret = png_write_u32_be(file, crc32_finalize(zw.crc));
+	if (ret != 0) {
+		return ret;
+	}
+
+	return png_write_chunk(file, "IEND", NULL, 0);
+}
+
 static int mount_sdcard(void)
 {
 	int ret = disk_access_ioctl(DISK_DRIVE_NAME, DISK_IOCTL_CTRL_INIT, NULL);
@@ -353,10 +548,16 @@ static int capture_png_to_sd(void)
 	uint32_t pitch;
 	int ret;
 	bool streaming = false;
-	uint8_t allocated = 0;
+	struct video_buffer *buffers[CONFIG_VIDEO_BUFFER_POOL_NUM_MAX] = { 0 };
+	uint8_t buffer_count = 0;
 
 	if (!device_is_ready(camera)) {
 		printk("Camera device not ready\n");
+		return -ENODEV;
+	}
+
+	if (!ov2640_detected()) {
+		printk("Camera not detected on I2C\n");
 		return -ENODEV;
 	}
 
@@ -367,24 +568,37 @@ static int capture_png_to_sd(void)
 	}
 
 	const struct video_format_cap *cap = caps.format_caps;
+	const struct video_format_cap *chosen = NULL;
 	while (cap && cap->pixelformat != 0) {
+		printk("Camera fmt %c%c%c%c %ux%u..%ux%u\n",
+		       (char)cap->pixelformat,
+		       (char)(cap->pixelformat >> 8),
+		       (char)(cap->pixelformat >> 16),
+		       (char)(cap->pixelformat >> 24),
+		       cap->width_min, cap->height_min,
+		       cap->width_max, cap->height_max);
 		if (cap->pixelformat == VIDEO_PIX_FMT_RGB565) {
-			if (!format_supports(cap, width, height)) {
-				width = cap->width_min;
-				height = cap->height_min;
-			}
+			chosen = cap;
 			break;
+		}
+		if (cap->pixelformat == VIDEO_PIX_FMT_YUYV && chosen == NULL) {
+			chosen = cap;
 		}
 		cap++;
 	}
 
-	if (!cap || cap->pixelformat == 0) {
-		printk("RGB565 not supported by camera\n");
+	if (chosen == NULL) {
+		printk("No supported camera format (need RGB565 or YUYV)\n");
 		return -ENOTSUP;
 	}
 
+	if (!format_supports(chosen, width, height)) {
+		width = chosen->width_min;
+		height = chosen->height_min;
+	}
+
 	fmt.type = VIDEO_BUF_TYPE_OUTPUT;
-	fmt.pixelformat = VIDEO_PIX_FMT_RGB565;
+	fmt.pixelformat = chosen->pixelformat;
 	fmt.width = width;
 	fmt.height = height;
 	fmt.pitch = 0;
@@ -397,23 +611,25 @@ static int capture_png_to_sd(void)
 
 	pitch = fmt.pitch ? fmt.pitch : (fmt.width * 2U);
 
-	uint8_t buffer_count = caps.min_vbuf_count ? caps.min_vbuf_count : 1U;
-	struct video_buffer buffers[2];
+	buffer_count = caps.min_vbuf_count ? caps.min_vbuf_count : 1U;
 	if (buffer_count > ARRAY_SIZE(buffers)) {
 		buffer_count = ARRAY_SIZE(buffers);
 	}
 
+	if (fmt.size == 0) {
+		fmt.size = fmt.width * fmt.height * 2U;
+	}
+
 	for (uint8_t i = 0; i < buffer_count; i++) {
-		buffers[i].type = VIDEO_BUF_TYPE_OUTPUT;
-		buffers[i].size = fmt.size ? fmt.size : (fmt.width * fmt.height * 2U);
-		buffers[i].buffer = k_malloc(buffers[i].size);
-		if (buffers[i].buffer == NULL) {
+		buffers[i] = video_buffer_aligned_alloc(fmt.size, CONFIG_VIDEO_BUFFER_POOL_ALIGN,
+							K_NO_WAIT);
+		if (buffers[i] == NULL) {
 			printk("No memory for frame buffer\n");
 			ret = -ENOMEM;
 			goto cleanup;
 		}
-		allocated++;
-		ret = video_enqueue(camera, &buffers[i]);
+		buffers[i]->type = VIDEO_BUF_TYPE_OUTPUT;
+		ret = video_enqueue(camera, buffers[i]);
 		if (ret != 0) {
 			printk("Enqueue failed (%d)\n", ret);
 			goto cleanup;
@@ -427,13 +643,23 @@ static int capture_png_to_sd(void)
 	}
 	streaming = true;
 
-	ret = video_dequeue(camera, &dequeued, K_SECONDS(2));
+	ret = video_dequeue(camera, &dequeued, K_SECONDS(10));
 	video_stream_stop(camera, VIDEO_BUF_TYPE_OUTPUT);
 	streaming = false;
 	if (ret != 0 || dequeued == NULL) {
 		printk("No frame received (%d)\n", ret);
 		ret = ret ? ret : -EIO;
 		goto cleanup;
+	}
+
+	printk("Frame bytesused=%u size=%u pitch=%u fmt.pitch=%u\n",
+	       dequeued->bytesused, dequeued->size, pitch, fmt.pitch);
+	if (dequeued->bytesused && (dequeued->bytesused / fmt.height) > 0) {
+		uint32_t computed = dequeued->bytesused / fmt.height;
+		if (computed != pitch) {
+			printk("Adjusting pitch %u -> %u\n", pitch, computed);
+			pitch = computed;
+		}
 	}
 
 	ret = mount_sdcard();
@@ -448,7 +674,13 @@ static int capture_png_to_sd(void)
 		goto cleanup;
 	}
 
-	ret = png_write_rgb565(&file, dequeued->buffer, fmt.width, fmt.height, pitch);
+	if (fmt.pixelformat == VIDEO_PIX_FMT_RGB565) {
+		ret = png_write_rgb565(&file, dequeued->buffer, fmt.width, fmt.height, pitch);
+	} else if (fmt.pixelformat == VIDEO_PIX_FMT_YUYV) {
+		ret = png_write_yuyv(&file, dequeued->buffer, fmt.width, fmt.height, pitch);
+	} else {
+		ret = -ENOTSUP;
+	}
 	fs_close(&file);
 	if (ret != 0) {
 		printk("PNG write failed (%d)\n", ret);
@@ -462,8 +694,10 @@ cleanup:
 	if (streaming) {
 		video_stream_stop(camera, VIDEO_BUF_TYPE_OUTPUT);
 	}
-	for (uint8_t i = 0; i < allocated; i++) {
-		k_free(buffers[i].buffer);
+	for (uint8_t i = 0; i < buffer_count; i++) {
+		if (buffers[i] != NULL) {
+			video_buffer_release(buffers[i]);
+		}
 	}
 	return ret;
 }
