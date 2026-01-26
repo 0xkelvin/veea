@@ -32,6 +32,231 @@ static struct fs_mount_t sd_mount = {
 	.mnt_point = DISK_MOUNT_PT,
 };
 
+static int ov2640_write_reg(const struct device *i2c, uint8_t reg, uint8_t val)
+{
+	uint8_t buf[2] = { reg, val };
+	return i2c_write(i2c, buf, 2, 0x30);
+}
+
+/* Essential OV2640 initialization registers (from Zephyr driver) */
+static const uint8_t ov2640_init_regs[][2] = {
+	/* Reset and basic sensor setup */
+	{0xFF, 0x01}, /* BANK_SEL = sensor */
+	{0x12, 0x80}, /* COM7 soft reset */
+};
+
+static const uint8_t ov2640_default_regs[][2] = {
+	{0xFF, 0x00}, /* BANK_SEL = DSP */
+	{0x2c, 0xff},
+	{0x2e, 0xdf},
+	{0xFF, 0x01}, /* BANK_SEL = sensor */
+	{0x3c, 0x32},
+	{0x11, 0x00}, /* CLKRC - no clock divider */
+	{0x09, 0x02}, /* COM2 - output drive 3x */
+	{0x04, 0x28 | 0x08}, /* REG04 */
+	{0x13, 0xC0 | 0x20 | 0x04 | 0x01}, /* COM8 */
+	{0x14, 0x08 | (0x02 << 5)}, /* COM9 - AGC gain 8x */
+	{0x15, 0x00}, /* COM10 */
+	{0x2c, 0x0c},
+	{0x33, 0x78},
+	{0x3a, 0x33},
+	{0x3b, 0xfb},
+	{0x3e, 0x00},
+	{0x43, 0x11},
+	{0x16, 0x10},
+	{0x39, 0x02},
+	{0x35, 0x88},
+	{0x22, 0x0a},
+	{0x37, 0x40},
+	{0x23, 0x00},
+	{0x34, 0xa0}, /* ARCOM2 */
+	{0x06, 0x02},
+	{0x06, 0x88},
+	{0x07, 0xc0},
+	{0x0d, 0xb7},
+	{0x0e, 0x01},
+	{0x4c, 0x00},
+	{0x4a, 0x81},
+	{0x21, 0x99},
+	{0x24, 0x40}, /* AEW */
+	{0x25, 0x38}, /* AEB */
+	{0x26, 0x82}, /* VV */
+	{0x48, 0x00}, /* COM19 */
+	{0x49, 0x00}, /* ZOOMS */
+	{0x5c, 0x00},
+	{0x63, 0x00},
+	{0x46, 0x00}, /* FLL */
+	{0x47, 0x00}, /* FLH */
+	{0x0C, 0x38 | 0x02}, /* COM3 */
+	{0x5D, 0x55},
+	{0x5E, 0x7d},
+	{0x5F, 0x7d},
+	{0x60, 0x55},
+	{0x61, 0x70}, /* HISTO_LOW */
+	{0x62, 0x80}, /* HISTO_HIGH */
+	{0x7c, 0x05},
+	{0x20, 0x80},
+	{0x28, 0x30},
+	{0x6c, 0x00},
+	{0x6d, 0x80},
+	{0x6e, 0x00},
+	{0x70, 0x02},
+	{0x71, 0x94},
+	{0x73, 0xc1},
+	{0x3d, 0x34},
+	{0x5a, 0x57},
+	{0x4F, 0xbb}, /* BD50 */
+	{0x50, 0x9c}, /* BD60 */
+	{0xFF, 0x00}, /* BANK_SEL = DSP */
+	{0xe5, 0x7f},
+	{0xF9, 0x80 | 0x40}, /* MC_BIST */
+	{0x41, 0x24},
+	{0xE0, 0x10 | 0x04}, /* RESET */
+	{0x76, 0xff},
+	{0x33, 0xa0},
+	{0x42, 0x20},
+	{0x43, 0x18},
+	{0x4c, 0x00},
+	{0x87, 0x80 | 0x40 | 0x10}, /* CTRL3 */
+	{0x88, 0x3f},
+	{0xd7, 0x03},
+	{0xd9, 0x10},
+	{0xD3, 0x80 | 0x02}, /* R_DVP_SP */
+	{0xc8, 0x08},
+	{0xc9, 0x80},
+	{0x7c, 0x00},
+	{0x7d, 0x00},
+	{0x7c, 0x03},
+	{0x7d, 0x48},
+	{0x7d, 0x48},
+	{0x7c, 0x08},
+	{0x7d, 0x20},
+	{0x7d, 0x10},
+	{0x7d, 0x0e},
+	{0x90, 0x00},
+	{0x91, 0x0e},
+	{0x91, 0x1a},
+	{0x91, 0x31},
+	{0x91, 0x5a},
+	{0x91, 0x69},
+	{0x91, 0x75},
+	{0x91, 0x7e},
+	{0x91, 0x88},
+	{0x91, 0x8f},
+	{0x91, 0x96},
+	{0x91, 0xa3},
+	{0x91, 0xaf},
+	{0x91, 0xc4},
+	{0x91, 0xd7},
+	{0x91, 0xe8},
+	{0x91, 0x20},
+	{0xC2, 0x08 | 0x04 | 0x02}, /* CTRL0 - enable YUV422/YUV/RGB */
+	{0x00, 0x00},
+};
+
+/* SVGA resolution settings */
+static const uint8_t ov2640_svga_regs[][2] = {
+	{0xFF, 0x01}, /* BANK_SEL = sensor */
+	{0x12, 0x00}, /* COM7 - SVGA */
+	{0x03, 0x0A}, /* COM1 */
+	{0x32, 0x09}, /* REG32 */
+	{0x17, 0x11}, /* HSTART */
+	{0x18, 0x43}, /* HSTOP */
+	{0x19, 0x00}, /* VSTART */
+	{0x1A, 0x4b}, /* VSTOP */
+	{0x3d, 0x38},
+	{0x35, 0xda},
+	{0x22, 0x1a},
+	{0x37, 0xc3},
+	{0x34, 0xc0},
+	{0x06, 0x88},
+	{0x0d, 0x87},
+	{0x0e, 0x41},
+	{0x42, 0x03},
+	{0xFF, 0x00}, /* BANK_SEL = DSP */
+	{0x05, 0x01}, /* R_BYPASS - bypass DSP */
+	{0xE0, 0x04}, /* RESET */
+	{0xC0, 0x64}, /* HSIZE8 = 800/8 = 100 = 0x64 */
+	{0xC1, 0x4B}, /* VSIZE8 = 600/8 = 75 = 0x4B */
+	{0x8C, 0x00}, /* SIZEL */
+	{0x53, 0x00}, /* XOFFL */
+	{0x54, 0x00}, /* YOFFL */
+	{0x51, 0xC8}, /* HSIZE = 800/4 = 200 = 0xC8 */
+	{0x52, 0x96}, /* VSIZE = 600/4 = 150 = 0x96 */
+	{0x55, 0x00}, /* VHYX */
+	{0x57, 0x00}, /* TEST */
+	{0x86, 0x20 | 0x10 | 0x04 | 0x01 | 0x08}, /* CTRL2 */
+	{0x50, 0x80 | 0x00}, /* CTRLI */
+	{0xD3, 0x80 | 0x04}, /* R_DVP_SP */
+	{0x05, 0x00}, /* R_BYPASS - enable DSP */
+	{0xE0, 0x00}, /* RESET - unreset DVP */
+};
+
+/* RGB565 output format */
+static const uint8_t ov2640_rgb565_regs[][2] = {
+	{0xFF, 0x00}, /* BANK_SEL = DSP */
+	{0xDA, 0x08}, /* IMAGE_MODE - RGB565 */
+	{0xD7, 0x03},
+	{0xDF, 0x00},
+	{0x33, 0xa0},
+	{0x3C, 0x00},
+	{0xe1, 0x67},
+	{0x00, 0x00},
+};
+
+static int ov2640_init_sensor(const struct device *i2c)
+{
+	int ret;
+	size_t i;
+
+	printk("Initializing OV2640 sensor...\n");
+
+	/* Soft reset */
+	ret = ov2640_write_reg(i2c, 0xFF, 0x01);
+	if (ret) return ret;
+	ret = ov2640_write_reg(i2c, 0x12, 0x80);
+	if (ret) return ret;
+	k_sleep(K_MSEC(100));
+
+	/* Write default registers */
+	for (i = 0; i < ARRAY_SIZE(ov2640_default_regs); i++) {
+		ret = ov2640_write_reg(i2c, ov2640_default_regs[i][0], 
+				       ov2640_default_regs[i][1]);
+		if (ret) {
+			printk("Failed to write default reg 0x%02x (%d)\n",
+			       ov2640_default_regs[i][0], ret);
+			return ret;
+		}
+	}
+
+	/* Set SVGA resolution */
+	for (i = 0; i < ARRAY_SIZE(ov2640_svga_regs); i++) {
+		ret = ov2640_write_reg(i2c, ov2640_svga_regs[i][0],
+				       ov2640_svga_regs[i][1]);
+		if (ret) {
+			printk("Failed to write SVGA reg 0x%02x (%d)\n",
+			       ov2640_svga_regs[i][0], ret);
+			return ret;
+		}
+	}
+
+	/* Set RGB565 output */
+	for (i = 0; i < ARRAY_SIZE(ov2640_rgb565_regs); i++) {
+		ret = ov2640_write_reg(i2c, ov2640_rgb565_regs[i][0],
+				       ov2640_rgb565_regs[i][1]);
+		if (ret) {
+			printk("Failed to write RGB565 reg 0x%02x (%d)\n",
+			       ov2640_rgb565_regs[i][0], ret);
+			return ret;
+		}
+	}
+
+	printk("OV2640 initialization complete\n");
+	return 0;
+}
+
+static const struct device *ov2640_i2c_bus;
+
 static bool ov2640_detected_on_bus(const struct device *i2c, const char *bus_name)
 {
 	uint8_t buf[2];
@@ -81,6 +306,15 @@ static bool ov2640_detected_on_bus(const struct device *i2c, const char *bus_nam
 	}
 
 	printk("%s OV2640 detected (PID 0x%02x VER 0x%02x)\n", bus_name, pid, ver);
+
+	/* Initialize the camera since Zephyr driver failed at boot */
+	ret = ov2640_init_sensor(i2c);
+	if (ret != 0) {
+		printk("OV2640 init failed (%d)\n", ret);
+		return false;
+	}
+
+	ov2640_i2c_bus = i2c;
 	return true;
 }
 
@@ -621,11 +855,18 @@ static int capture_png_to_sd(void)
 	fmt.height = height;
 	fmt.pitch = 0;
 
+	/* Try setting format twice - first to trigger any lazy init, second for real */
 	ret = video_set_format(camera, &fmt);
+	if (ret != 0) {
+		printk("First set format failed (%d), retrying...\n", ret);
+		k_sleep(K_MSEC(100));
+		ret = video_set_format(camera, &fmt);
+	}
 	if (ret != 0) {
 		printk("Failed to set format (%d)\n", ret);
 		return ret;
 	}
+	printk("Format set: %ux%u pitch=%u size=%u\n", fmt.width, fmt.height, fmt.pitch, fmt.size);
 
 	pitch = fmt.pitch ? fmt.pitch : (fmt.width * 2U);
 
@@ -683,8 +924,12 @@ static int capture_png_to_sd(void)
 		}
 	}
 
+	printk("*** Camera capture successful! ***\n");
+
 	ret = mount_sdcard();
 	if (ret != 0) {
+		printk("SD card not available - image not saved\n");
+		ret = 0; /* Don't treat missing SD card as failure */
 		goto cleanup;
 	}
 
