@@ -34,7 +34,7 @@ static struct fs_mount_t sd_mount = {
 
 static bool ov2640_detected_on_bus(const struct device *i2c, const char *bus_name)
 {
-	uint8_t reg;
+	uint8_t buf[2];
 	uint8_t pid = 0;
 	uint8_t ver = 0;
 	int ret;
@@ -44,17 +44,31 @@ static bool ov2640_detected_on_bus(const struct device *i2c, const char *bus_nam
 		return false;
 	}
 
-	k_sleep(K_MSEC(50));
+	/* Wait for camera to power up */
+	k_sleep(K_MSEC(100));
 
-	reg = 0x0A;
-	ret = i2c_write_read(i2c, 0x30, &reg, sizeof(reg), &pid, sizeof(pid));
+	/* Select sensor register bank (0xFF = 0x01) */
+	buf[0] = 0xFF;
+	buf[1] = 0x01;
+	ret = i2c_write(i2c, buf, 2, 0x30);
 	if (ret != 0) {
-		printk("%s OV2640 ID read failed (%d)\n", bus_name, ret);
+		printk("%s OV2640 bank select failed (%d)\n", bus_name, ret);
 		return false;
 	}
 
-	reg = 0x0B;
-	ret = i2c_write_read(i2c, 0x30, &reg, sizeof(reg), &ver, sizeof(ver));
+	k_sleep(K_MSEC(10));
+
+	/* Read PID register (0x0A) */
+	buf[0] = 0x0A;
+	ret = i2c_write_read(i2c, 0x30, buf, 1, &pid, 1);
+	if (ret != 0) {
+		printk("%s OV2640 PID read failed (%d)\n", bus_name, ret);
+		return false;
+	}
+
+	/* Read VER register (0x0B) */
+	buf[0] = 0x0B;
+	ret = i2c_write_read(i2c, 0x30, buf, 1, &ver, 1);
 	if (ret != 0) {
 		printk("%s OV2640 VER read failed (%d)\n", bus_name, ret);
 		return false;
@@ -323,7 +337,8 @@ static int png_write_rgb565(struct fs_file_t *file, const uint8_t *rgb565,
 		const uint8_t *row = rgb565 + (y * pitch);
 		row_buf[0] = 0;
 		for (uint32_t x = 0; x < width; x++) {
-			uint16_t pixel = ((uint16_t)row[2 * x + 1] << 8) | row[2 * x];
+			/* ESP32 DVP outputs RGB565 big-endian (high byte first) */
+			uint16_t pixel = ((uint16_t)row[2 * x] << 8) | row[2 * x + 1];
 			uint8_t r = (pixel >> 11) & 0x1F;
 			uint8_t g = (pixel >> 5) & 0x3F;
 			uint8_t b = pixel & 0x1F;
@@ -561,6 +576,9 @@ static int capture_png_to_sd(void)
 		return -ENODEV;
 	}
 
+	/* Give camera time to stabilize after I2C probing */
+	k_sleep(K_MSEC(500));
+
 	ret = video_get_caps(camera, &caps);
 	if (ret != 0) {
 		printk("Camera caps failed (%d)\n", ret);
@@ -642,6 +660,9 @@ static int capture_png_to_sd(void)
 		goto cleanup;
 	}
 	streaming = true;
+
+	/* Give camera time to produce first frame */
+	k_sleep(K_MSEC(200));
 
 	ret = video_dequeue(camera, &dequeued, K_SECONDS(10));
 	video_stream_stop(camera, VIDEO_BUF_TYPE_OUTPUT);
