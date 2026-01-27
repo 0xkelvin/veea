@@ -8,11 +8,12 @@
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/fs/fs.h>
 #include <zephyr/storage/disk_access.h>
+#include <zephyr/multi_heap/shared_multi_heap.h>
 #include <ff.h>
 
 #define DISK_DRIVE_NAME "SD"
 #define DISK_MOUNT_PT "/SD:"
-#define CAPTURE_PATH DISK_MOUNT_PT "/capture.png"
+#define CAPTURE_PATH DISK_MOUNT_PT "/capture.bmp"
 
 #define PNG_BLOCK_SIZE 65535U
 
@@ -54,9 +55,13 @@ static const uint8_t ov2640_default_regs[][2] = {
 	{0x11, 0x00}, /* CLKRC - no clock divider */
 	{0x09, 0x02}, /* COM2 - output drive 3x */
 	{0x04, 0x28 | 0x08}, /* REG04 */
-	{0x13, 0xC0 | 0x20 | 0x04 | 0x01}, /* COM8 */
-	{0x14, 0x08 | (0x02 << 5)}, /* COM9 - AGC gain 8x */
+	{0x13, 0xE7}, /* COM8 - enable AGC, AEC, AWB, banding filter */
+	{0x14, 0x08 | (0x07 << 5)}, /* COM9 - AGC gain ceiling 128x (max) */
 	{0x15, 0x00}, /* COM10 */
+	{0x2D, 0x00}, /* AEC LSB */
+	{0x2E, 0x00}, /* AEC MSB */
+	{0x45, 0x7F}, /* AECHH - AEC high bits (max exposure time) */
+	{0x10, 0xFF}, /* AEC[7:0] - longer exposure */
 	{0x2c, 0x0c},
 	{0x33, 0x78},
 	{0x3a, 0x33},
@@ -78,9 +83,9 @@ static const uint8_t ov2640_default_regs[][2] = {
 	{0x4c, 0x00},
 	{0x4a, 0x81},
 	{0x21, 0x99},
-	{0x24, 0x40}, /* AEW */
-	{0x25, 0x38}, /* AEB */
-	{0x26, 0x82}, /* VV */
+	{0x24, 0xA0}, /* AEW - target brightness (very high) */
+	{0x25, 0x90}, /* AEB - floor brightness (very high) */
+	{0x26, 0xD6}, /* VV - AEC/AGC thresholds */
 	{0x48, 0x00}, /* COM19 */
 	{0x49, 0x00}, /* ZOOMS */
 	{0x5c, 0x00},
@@ -154,43 +159,10 @@ static const uint8_t ov2640_default_regs[][2] = {
 	{0x00, 0x00},
 };
 
-/* SVGA resolution settings */
-static const uint8_t ov2640_svga_regs[][2] = {
-	{0xFF, 0x01}, /* BANK_SEL = sensor */
-	{0x12, 0x00}, /* COM7 - SVGA */
-	{0x03, 0x0A}, /* COM1 */
-	{0x32, 0x09}, /* REG32 */
-	{0x17, 0x11}, /* HSTART */
-	{0x18, 0x43}, /* HSTOP */
-	{0x19, 0x00}, /* VSTART */
-	{0x1A, 0x4b}, /* VSTOP */
-	{0x3d, 0x38},
-	{0x35, 0xda},
-	{0x22, 0x1a},
-	{0x37, 0xc3},
-	{0x34, 0xc0},
-	{0x06, 0x88},
-	{0x0d, 0x87},
-	{0x0e, 0x41},
-	{0x42, 0x03},
-	{0xFF, 0x00}, /* BANK_SEL = DSP */
-	{0x05, 0x01}, /* R_BYPASS - bypass DSP */
-	{0xE0, 0x04}, /* RESET */
-	{0xC0, 0x64}, /* HSIZE8 = 800/8 = 100 = 0x64 */
-	{0xC1, 0x4B}, /* VSIZE8 = 600/8 = 75 = 0x4B */
-	{0x8C, 0x00}, /* SIZEL */
-	{0x53, 0x00}, /* XOFFL */
-	{0x54, 0x00}, /* YOFFL */
-	{0x51, 0xC8}, /* HSIZE = 800/4 = 200 = 0xC8 */
-	{0x52, 0x96}, /* VSIZE = 600/4 = 150 = 0x96 */
-	{0x55, 0x00}, /* VHYX */
-	{0x57, 0x00}, /* TEST */
-	{0x86, 0x20 | 0x10 | 0x04 | 0x01 | 0x08}, /* CTRL2 */
-	{0x50, 0x80 | 0x00}, /* CTRLI */
-	{0xD3, 0x80 | 0x04}, /* R_DVP_SP */
-	{0x05, 0x00}, /* R_BYPASS - enable DSP */
-	{0xE0, 0x00}, /* RESET - unreset DVP */
-};
+/* 
+ * Note: Resolution is set by the Zephyr OV2640 driver via video_set_format().
+ * We don't need manual resolution registers - the driver handles UXGA (1600x1200).
+ */
 
 /* RGB565 output format */
 static const uint8_t ov2640_rgb565_regs[][2] = {
@@ -218,7 +190,7 @@ static int ov2640_init_sensor(const struct device *i2c)
 	if (ret) return ret;
 	k_sleep(K_MSEC(100));
 
-	/* Write default registers */
+	/* Write default registers (exposure, gain settings) */
 	for (i = 0; i < ARRAY_SIZE(ov2640_default_regs); i++) {
 		ret = ov2640_write_reg(i2c, ov2640_default_regs[i][0], 
 				       ov2640_default_regs[i][1]);
@@ -229,18 +201,9 @@ static int ov2640_init_sensor(const struct device *i2c)
 		}
 	}
 
-	/* Set SVGA resolution */
-	for (i = 0; i < ARRAY_SIZE(ov2640_svga_regs); i++) {
-		ret = ov2640_write_reg(i2c, ov2640_svga_regs[i][0],
-				       ov2640_svga_regs[i][1]);
-		if (ret) {
-			printk("Failed to write SVGA reg 0x%02x (%d)\n",
-			       ov2640_svga_regs[i][0], ret);
-			return ret;
-		}
-	}
+	/* Note: Resolution is set by Zephyr driver via video_set_format() */
 
-	/* Set RGB565 output */
+	/* Set RGB565 output format and brightness boost */
 	for (i = 0; i < ARRAY_SIZE(ov2640_rgb565_regs); i++) {
 		ret = ov2640_write_reg(i2c, ov2640_rgb565_regs[i][0],
 				       ov2640_rgb565_regs[i][1]);
@@ -251,7 +214,9 @@ static int ov2640_init_sensor(const struct device *i2c)
 		}
 	}
 
-	printk("OV2640 initialization complete\n");
+	/* Wait for auto-exposure to stabilize */
+	printk("OV2640 initialization complete, waiting for AEC...\n");
+	k_sleep(K_MSEC(500));
 	return 0;
 }
 
@@ -584,11 +549,11 @@ static int png_write_rgb565(struct fs_file_t *file, const uint8_t *rgb565,
 
 		ret = zlib_write_data(&zw, row_buf, 1 + (width * 3U));
 		if (ret != 0) {
-			k_free(row_buf);
+			shared_multi_heap_free(row_buf);
 			return ret;
 		}
 	}
-	k_free(row_buf);
+	shared_multi_heap_free(row_buf);
 
 	uint8_t adler_be[4] = {
 		(uint8_t)(zw.adler >> 24),
@@ -725,11 +690,11 @@ static int png_write_yuyv(struct fs_file_t *file, const uint8_t *yuyv,
 
 		ret = zlib_write_data(&zw, row_buf, 1 + (width * 3U));
 		if (ret != 0) {
-			k_free(row_buf);
+			shared_multi_heap_free(row_buf);
 			return ret;
 		}
 	}
-	k_free(row_buf);
+	shared_multi_heap_free(row_buf);
 
 	uint8_t adler_be[4] = {
 		(uint8_t)(zw.adler >> 24),
@@ -768,6 +733,94 @@ static int mount_sdcard(void)
 	return 0;
 }
 
+/* Write raw RGB565 as 24-bit BMP file (simpler than PNG, good for debugging) */
+static int bmp_write_rgb565(struct fs_file_t *file, const uint8_t *rgb565,
+			    uint32_t width, uint32_t height, uint32_t pitch)
+{
+	/* BMP Header (14 bytes) + DIB Header (40 bytes) = 54 bytes */
+	uint8_t header[54];
+	uint32_t row_size = ((width * 3 + 3) / 4) * 4; /* 24-bit, padded to 4 bytes */
+	uint32_t pixel_data_size = row_size * height;
+	uint32_t file_size = 54 + pixel_data_size;
+	uint8_t *row_buf;
+	int ret;
+
+	/* Allocate from PSRAM for large row buffers */
+	row_buf = shared_multi_heap_alloc(SMH_REG_ATTR_EXTERNAL, row_size);
+	if (!row_buf) {
+		row_buf = k_malloc(row_size);
+	}
+	if (!row_buf) {
+		printk("BMP: no memory for row buffer (%u bytes)\n", row_size);
+		return -ENOMEM;
+	}
+
+	memset(header, 0, sizeof(header));
+
+	/* BMP Header */
+	header[0] = 'B';
+	header[1] = 'M';
+	header[2] = file_size & 0xFF;
+	header[3] = (file_size >> 8) & 0xFF;
+	header[4] = (file_size >> 16) & 0xFF;
+	header[5] = (file_size >> 24) & 0xFF;
+	/* Reserved (4 bytes) = 0 */
+	header[10] = 54; /* Pixel data offset */
+
+	/* DIB Header (BITMAPINFOHEADER) */
+	header[14] = 40; /* DIB header size */
+	header[18] = width & 0xFF;
+	header[19] = (width >> 8) & 0xFF;
+	header[20] = (width >> 16) & 0xFF;
+	header[21] = (width >> 24) & 0xFF;
+	header[22] = height & 0xFF;
+	header[23] = (height >> 8) & 0xFF;
+	header[24] = (height >> 16) & 0xFF;
+	header[25] = (height >> 24) & 0xFF;
+	header[26] = 1; /* Color planes */
+	header[28] = 24; /* Bits per pixel */
+	/* Compression = 0 (BI_RGB) */
+	header[34] = pixel_data_size & 0xFF;
+	header[35] = (pixel_data_size >> 8) & 0xFF;
+	header[36] = (pixel_data_size >> 16) & 0xFF;
+	header[37] = (pixel_data_size >> 24) & 0xFF;
+
+	ret = fs_write_all(file, header, sizeof(header));
+	if (ret != 0) {
+		shared_multi_heap_free(row_buf);
+		return ret;
+	}
+
+	/* BMP stores rows bottom-to-top */
+	for (int32_t y = height - 1; y >= 0; y--) {
+		const uint8_t *src_row = rgb565 + y * pitch;
+		memset(row_buf, 0, row_size);
+
+		for (uint32_t x = 0; x < width; x++) {
+			/* RGB565 big-endian from ESP32 DVP */
+			uint16_t pixel = ((uint16_t)src_row[2 * x] << 8) | src_row[2 * x + 1];
+			uint8_t r = (pixel >> 11) & 0x1F;
+			uint8_t g = (pixel >> 5) & 0x3F;
+			uint8_t b = pixel & 0x1F;
+
+			/* Expand to 8-bit and store as BGR */
+			row_buf[x * 3 + 0] = (b << 3) | (b >> 2);
+			row_buf[x * 3 + 1] = (g << 2) | (g >> 4);
+			row_buf[x * 3 + 2] = (r << 3) | (r >> 2);
+		}
+
+		ret = fs_write_all(file, row_buf, row_size);
+		if (ret != 0) {
+			shared_multi_heap_free(row_buf);
+			return ret;
+		}
+	}
+
+	shared_multi_heap_free(row_buf);
+	printk("BMP: wrote %ux%u image (%u bytes)\n", width, height, file_size);
+	return 0;
+}
+
 static bool format_supports(const struct video_format_cap *cap, uint32_t width, uint32_t height)
 {
 	if (width < cap->width_min || width > cap->width_max) {
@@ -785,15 +838,15 @@ static bool format_supports(const struct video_format_cap *cap, uint32_t width, 
 	return true;
 }
 
-static int capture_png_to_sd(void)
+static int capture_bmp_to_sd(void)
 {
 	const struct device *camera = DEVICE_DT_GET(DT_CHOSEN(zephyr_camera));
 	struct video_caps caps = { .type = VIDEO_BUF_TYPE_OUTPUT };
 	struct video_format fmt = { 0 };
 	struct video_buffer *dequeued = NULL;
 	struct fs_file_t file;
-	uint32_t width = 160;
-	uint32_t height = 120;
+	uint32_t width = 800;
+	uint32_t height = 600;
 	uint32_t pitch;
 	int ret;
 	bool streaming = false;
@@ -819,34 +872,44 @@ static int capture_png_to_sd(void)
 		return ret;
 	}
 
+	/* Find the format cap matching our target resolution */
 	const struct video_format_cap *cap = caps.format_caps;
 	const struct video_format_cap *chosen = NULL;
+	const struct video_format_cap *fallback = NULL;
+	
+	printk("Looking for %ux%u RGB565...\n", width, height);
 	while (cap && cap->pixelformat != 0) {
-		printk("Camera fmt %c%c%c%c %ux%u..%ux%u\n",
+		printk("  Available: %c%c%c%c %ux%u\n",
 		       (char)cap->pixelformat,
 		       (char)(cap->pixelformat >> 8),
 		       (char)(cap->pixelformat >> 16),
 		       (char)(cap->pixelformat >> 24),
-		       cap->width_min, cap->height_min,
-		       cap->width_max, cap->height_max);
+		       cap->width_min, cap->height_min);
 		if (cap->pixelformat == VIDEO_PIX_FMT_RGB565) {
-			chosen = cap;
-			break;
-		}
-		if (cap->pixelformat == VIDEO_PIX_FMT_YUYV && chosen == NULL) {
-			chosen = cap;
+			/* Exact match for our target resolution */
+			if (cap->width_min == width && cap->height_min == height) {
+				chosen = cap;
+				printk("  -> Found exact match!\n");
+			}
+			/* Keep track of largest RGB565 as fallback */
+			if (fallback == NULL || cap->width_min > fallback->width_min) {
+				fallback = cap;
+			}
 		}
 		cap++;
 	}
 
-	if (chosen == NULL) {
-		printk("No supported camera format (need RGB565 or YUYV)\n");
-		return -ENOTSUP;
+	if (chosen == NULL && fallback != NULL) {
+		printk("Exact resolution not found, using %ux%u\n", 
+		       fallback->width_min, fallback->height_min);
+		chosen = fallback;
+		width = fallback->width_min;
+		height = fallback->height_min;
 	}
 
-	if (!format_supports(chosen, width, height)) {
-		width = chosen->width_min;
-		height = chosen->height_min;
+	if (chosen == NULL) {
+		printk("No supported camera format (need RGB565)\n");
+		return -ENOTSUP;
 	}
 
 	fmt.type = VIDEO_BUF_TYPE_OUTPUT;
@@ -855,19 +918,32 @@ static int capture_png_to_sd(void)
 	fmt.height = height;
 	fmt.pitch = 0;
 
-	/* Try setting format twice - first to trigger any lazy init, second for real */
 	ret = video_set_format(camera, &fmt);
 	if (ret != 0) {
-		printk("First set format failed (%d), retrying...\n", ret);
-		k_sleep(K_MSEC(100));
-		ret = video_set_format(camera, &fmt);
-	}
-	if (ret != 0) {
-		printk("Failed to set format (%d)\n", ret);
+		printk("Set format failed (%d)\n", ret);
 		return ret;
 	}
+
+	/* Use what the driver actually set */
+	width = fmt.width;
+	height = fmt.height;
 	printk("Format set: %ux%u pitch=%u size=%u\n", fmt.width, fmt.height, fmt.pitch, fmt.size);
 
+	/* Apply brightness settings AFTER format is set (driver may have reset them) */
+	if (ov2640_i2c_bus) {
+		printk("Applying manual exposure settings...\n");
+		ov2640_write_reg(ov2640_i2c_bus, 0xFF, 0x01); /* BANK_SEL = sensor */
+		/* Disable AEC for manual control */
+		ov2640_write_reg(ov2640_i2c_bus, 0x13, 0xE0); /* COM8 - disable AEC, keep AGC/AWB */
+		/* Set manual exposure to maximum */
+		ov2640_write_reg(ov2640_i2c_bus, 0x10, 0xFF); /* AEC[7:0] */
+		ov2640_write_reg(ov2640_i2c_bus, 0x04, 0x03); /* AEC[1:0] in REG04 */
+		ov2640_write_reg(ov2640_i2c_bus, 0x45, 0x3F); /* AEC[15:10] */
+		/* Maximum gain */
+		ov2640_write_reg(ov2640_i2c_bus, 0x14, 0x08 | (0x07 << 5)); /* COM9 - AGC ceiling 128x */
+		ov2640_write_reg(ov2640_i2c_bus, 0x00, 0x7F); /* GAIN - high gain */
+	}
+	
 	pitch = fmt.pitch ? fmt.pitch : (fmt.width * 2U);
 
 	buffer_count = caps.min_vbuf_count ? caps.min_vbuf_count : 1U;
@@ -880,14 +956,31 @@ static int capture_png_to_sd(void)
 	}
 
 	for (uint8_t i = 0; i < buffer_count; i++) {
-		buffers[i] = video_buffer_aligned_alloc(fmt.size, CONFIG_VIDEO_BUFFER_POOL_ALIGN,
-							K_NO_WAIT);
-		if (buffers[i] == NULL) {
-			printk("No memory for frame buffer\n");
+		/* Allocate video_buffer struct + data buffer from PSRAM */
+		size_t total_size = sizeof(struct video_buffer) + fmt.size + CONFIG_VIDEO_BUFFER_POOL_ALIGN;
+		bool from_psram = false;
+		uint8_t *mem = shared_multi_heap_alloc(SMH_REG_ATTR_EXTERNAL, total_size);
+		if (mem != NULL) {
+			from_psram = true;
+		} else {
+			/* Fallback to system heap */
+			mem = k_malloc(total_size);
+		}
+		if (mem == NULL) {
+			printk("No memory for frame buffer (%u bytes)\n", total_size);
 			ret = -ENOMEM;
 			goto cleanup;
 		}
+		printk("Allocated %u bytes from %s\n", total_size, from_psram ? "PSRAM" : "heap");
+		buffers[i] = (struct video_buffer *)mem;
+		memset(buffers[i], 0, sizeof(struct video_buffer));
+		/* Align buffer data */
+		uintptr_t data_addr = (uintptr_t)(mem + sizeof(struct video_buffer));
+		data_addr = (data_addr + CONFIG_VIDEO_BUFFER_POOL_ALIGN - 1) & ~(CONFIG_VIDEO_BUFFER_POOL_ALIGN - 1);
+		buffers[i]->buffer = (uint8_t *)data_addr;
+		buffers[i]->size = fmt.size;
 		buffers[i]->type = VIDEO_BUF_TYPE_OUTPUT;
+		printk("Buffer %d allocated at %p (data at %p, %u bytes)\n", i, buffers[i], buffers[i]->buffer, fmt.size);
 		ret = video_enqueue(camera, buffers[i]);
 		if (ret != 0) {
 			printk("Enqueue failed (%d)\n", ret);
@@ -902,8 +995,9 @@ static int capture_png_to_sd(void)
 	}
 	streaming = true;
 
-	/* Give camera time to produce first frame */
-	k_sleep(K_MSEC(200));
+	/* Wait for auto-exposure to stabilize before capturing (AEC needs time) */
+	printk("Waiting for auto-exposure to stabilize...\n");
+	k_sleep(K_MSEC(3000));
 
 	ret = video_dequeue(camera, &dequeued, K_SECONDS(10));
 	video_stream_stop(camera, VIDEO_BUF_TYPE_OUTPUT);
@@ -941,15 +1035,17 @@ static int capture_png_to_sd(void)
 	}
 
 	if (fmt.pixelformat == VIDEO_PIX_FMT_RGB565) {
-		ret = png_write_rgb565(&file, dequeued->buffer, fmt.width, fmt.height, pitch);
+		ret = bmp_write_rgb565(&file, dequeued->buffer, fmt.width, fmt.height, pitch);
 	} else if (fmt.pixelformat == VIDEO_PIX_FMT_YUYV) {
-		ret = png_write_yuyv(&file, dequeued->buffer, fmt.width, fmt.height, pitch);
+		/* For YUYV, convert to RGB565 first or save raw - for now just log */
+		printk("YUYV format - saving raw data\n");
+		ret = fs_write_all(&file, dequeued->buffer, dequeued->bytesused);
 	} else {
 		ret = -ENOTSUP;
 	}
 	fs_close(&file);
 	if (ret != 0) {
-		printk("PNG write failed (%d)\n", ret);
+		printk("BMP write failed (%d)\n", ret);
 		goto cleanup;
 	}
 
@@ -962,7 +1058,8 @@ cleanup:
 	}
 	for (uint8_t i = 0; i < buffer_count; i++) {
 		if (buffers[i] != NULL) {
-			video_buffer_release(buffers[i]);
+			/* Try PSRAM free first, then system heap */
+			shared_multi_heap_free(buffers[i]);
 		}
 	}
 	return ret;
@@ -979,6 +1076,7 @@ int main(void)
 
 	printk("Veea device base starting...\n");
 
+	
 	err = bt_enable(NULL);
 	if (err) {
 		printk("Bluetooth init failed (err %d)\n", err);
@@ -993,7 +1091,7 @@ int main(void)
 
 	printk("BLE advertising started\n");
 
-	err = capture_png_to_sd();
+	err = capture_bmp_to_sd();
 	if (err != 0) {
 		printk("Capture failed (%d)\n", err);
 	}
