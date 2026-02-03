@@ -21,11 +21,11 @@ west build -b veea-device /Users/kelvin/Veea/veea/device/firmware
 west flash
 ```
 
-## Monitor 
+## Monitor
+
 ```sh
 west espressif monitor
 ```
-
 
 ## Next steps
 
