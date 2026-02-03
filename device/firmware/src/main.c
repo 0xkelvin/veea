@@ -46,22 +46,27 @@ static const uint8_t ov2640_init_regs[][2] = {
 	{0x12, 0x80}, /* COM7 soft reset */
 };
 
+/*
+ * OV2640 default registers aligned with omiGlass (omiGlass firmware
+ * ov2640_settings_cif + RGB565 path). Same resolution/quality tuning
+ * as omiGlass: VGA 640x480, AEC/AGC targets and JPEG-quality-style tuning.
+ */
 static const uint8_t ov2640_default_regs[][2] = {
 	{0xFF, 0x00}, /* BANK_SEL = DSP */
 	{0x2c, 0xff},
 	{0x2e, 0xdf},
 	{0xFF, 0x01}, /* BANK_SEL = sensor */
 	{0x3c, 0x32},
-	{0x11, 0x00}, /* CLKRC - no clock divider */
+	{0x11, 0x01}, /* CLKRC - omiGlass: clock divider for stability */
 	{0x09, 0x02}, /* COM2 - output drive 3x */
 	{0x04, 0x28 | 0x08}, /* REG04 */
-	{0x13, 0xE7}, /* COM8 - enable AGC, AEC, AWB, banding filter */
-	{0x14, 0x08 | (0x07 << 5)}, /* COM9 - AGC gain ceiling 128x (max) */
+	{0x13, 0xE5}, /* COM8 - omiGlass: AGC, AEC, banding filter (no AWB in COM8) */
+	{0x14, 0x08 | (0x02 << 5)}, /* COM9 - omiGlass: AGC gain ceiling 8x (CAMERA_JPEG_QUALITY style) */
 	{0x15, 0x00}, /* COM10 */
 	{0x2D, 0x00}, /* AEC LSB */
 	{0x2E, 0x00}, /* AEC MSB */
-	{0x45, 0x7F}, /* AECHH - AEC high bits (max exposure time) */
-	{0x10, 0xFF}, /* AEC[7:0] - longer exposure */
+	{0x45, 0x00}, /* AECHH */
+	{0x10, 0x00}, /* AEC[7:0] */
 	{0x2c, 0x0c},
 	{0x33, 0x78},
 	{0x3a, 0x33},
@@ -69,23 +74,22 @@ static const uint8_t ov2640_default_regs[][2] = {
 	{0x3e, 0x00},
 	{0x43, 0x11},
 	{0x16, 0x10},
-	{0x39, 0x02},
-	{0x35, 0x88},
-	{0x22, 0x0a},
-	{0x37, 0x40},
+	{0x39, 0x92}, /* omiGlass CIF */
+	{0x35, 0xda}, /* omiGlass CIF */
+	{0x22, 0x1a}, /* omiGlass AEW-style */
+	{0x37, 0xc3}, /* omiGlass CIF */
 	{0x23, 0x00},
-	{0x34, 0xa0}, /* ARCOM2 */
-	{0x06, 0x02},
+	{0x34, 0xc0}, /* ARCOM2 omiGlass CIF */
 	{0x06, 0x88},
 	{0x07, 0xc0},
-	{0x0d, 0xb7},
-	{0x0e, 0x01},
+	{0x0d, 0x87}, /* COM4 omiGlass */
+	{0x0e, 0x41}, /* omiGlass CIF */
 	{0x4c, 0x00},
 	{0x4a, 0x81},
 	{0x21, 0x99},
-	{0x24, 0xA0}, /* AEW - target brightness (very high) */
-	{0x25, 0x90}, /* AEB - floor brightness (very high) */
-	{0x26, 0xD6}, /* VV - AEC/AGC thresholds */
+	{0x24, 0x40}, /* AEW - omiGlass target brightness */
+	{0x25, 0x38}, /* AEB - omiGlass floor brightness */
+	{0x26, 0x82}, /* VV - omiGlass AEC/AGC thresholds */
 	{0x48, 0x00}, /* COM19 */
 	{0x49, 0x00}, /* ZOOMS */
 	{0x5c, 0x00},
@@ -103,15 +107,15 @@ static const uint8_t ov2640_default_regs[][2] = {
 	{0x20, 0x80},
 	{0x28, 0x30},
 	{0x6c, 0x00},
-	{0x6d, 0x80},
+	{0x6d, 0x00}, /* omiGlass CIF */
 	{0x6e, 0x00},
 	{0x70, 0x02},
 	{0x71, 0x94},
 	{0x73, 0xc1},
-	{0x3d, 0x34},
-	{0x5a, 0x57},
-	{0x4F, 0xbb}, /* BD50 */
-	{0x50, 0x9c}, /* BD60 */
+	{0x3d, 0x38}, /* omiGlass CIF */
+	{0x5a, 0x23}, /* omiGlass CIF */
+	{0x4F, 0xca}, /* BD50 omiGlass CIF */
+	{0x50, 0xa8}, /* BD60 omiGlass CIF */
 	{0xFF, 0x00}, /* BANK_SEL = DSP */
 	{0xe5, 0x7f},
 	{0xF9, 0x80 | 0x40}, /* MC_BIST */
@@ -159,9 +163,8 @@ static const uint8_t ov2640_default_regs[][2] = {
 	{0x00, 0x00},
 };
 
-/* 
- * Note: Resolution is set by the Zephyr OV2640 driver via video_set_format().
- * We don't need manual resolution registers - the driver handles UXGA (1600x1200).
+/*
+ * Resolution: same as omiGlass FRAMESIZE_VGA = 640x480 (video_set_format below).
  */
 
 /* RGB565 output format */
@@ -203,7 +206,7 @@ static int ov2640_init_sensor(const struct device *i2c)
 
 	/* Note: Resolution is set by Zephyr driver via video_set_format() */
 
-	/* Set RGB565 output format and brightness boost */
+	/* Set RGB565 output format */
 	for (i = 0; i < ARRAY_SIZE(ov2640_rgb565_regs); i++) {
 		ret = ov2640_write_reg(i2c, ov2640_rgb565_regs[i][0],
 				       ov2640_rgb565_regs[i][1]);
@@ -845,8 +848,9 @@ static int capture_bmp_to_sd(void)
 	struct video_format fmt = { 0 };
 	struct video_buffer *dequeued = NULL;
 	struct fs_file_t file;
-	uint32_t width = 800;
-	uint32_t height = 600;
+	/* Same as omiGlass: FRAMESIZE_VGA = 640x480 */
+	uint32_t width = 640;
+	uint32_t height = 480;
 	uint32_t pitch;
 	int ret;
 	bool streaming = false;
@@ -929,19 +933,15 @@ static int capture_bmp_to_sd(void)
 	height = fmt.height;
 	printk("Format set: %ux%u pitch=%u size=%u\n", fmt.width, fmt.height, fmt.pitch, fmt.size);
 
-	/* Apply brightness settings AFTER format is set (driver may have reset them) */
+	/* Apply omiGlass-style exposure/AEC after format (driver may reset) */
 	if (ov2640_i2c_bus) {
-		printk("Applying manual exposure settings...\n");
+		printk("Applying omiGlass exposure/AEC settings...\n");
 		ov2640_write_reg(ov2640_i2c_bus, 0xFF, 0x01); /* BANK_SEL = sensor */
-		/* Disable AEC for manual control */
-		ov2640_write_reg(ov2640_i2c_bus, 0x13, 0xE0); /* COM8 - disable AEC, keep AGC/AWB */
-		/* Set manual exposure to maximum */
-		ov2640_write_reg(ov2640_i2c_bus, 0x10, 0xFF); /* AEC[7:0] */
-		ov2640_write_reg(ov2640_i2c_bus, 0x04, 0x03); /* AEC[1:0] in REG04 */
-		ov2640_write_reg(ov2640_i2c_bus, 0x45, 0x3F); /* AEC[15:10] */
-		/* Maximum gain */
-		ov2640_write_reg(ov2640_i2c_bus, 0x14, 0x08 | (0x07 << 5)); /* COM9 - AGC ceiling 128x */
-		ov2640_write_reg(ov2640_i2c_bus, 0x00, 0x7F); /* GAIN - high gain */
+		ov2640_write_reg(ov2640_i2c_bus, 0x13, 0xE5); /* COM8 - AGC, AEC, banding */
+		ov2640_write_reg(ov2640_i2c_bus, 0x24, 0x40); /* AEW - omiGlass target */
+		ov2640_write_reg(ov2640_i2c_bus, 0x25, 0x38); /* AEB - omiGlass floor */
+		ov2640_write_reg(ov2640_i2c_bus, 0x26, 0x82); /* VV - omiGlass thresholds */
+		ov2640_write_reg(ov2640_i2c_bus, 0x14, 0x08 | (0x02 << 5)); /* COM9 - AGC 8x */
 	}
 	
 	pitch = fmt.pitch ? fmt.pitch : (fmt.width * 2U);
