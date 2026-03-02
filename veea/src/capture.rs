@@ -50,6 +50,55 @@ impl CaptureEngine {
         self.db.connection_path()
     }
 
+    /// Capture a single snapshot and store as PNG.
+    pub fn snapshot_png(&mut self, label: &str) -> AppResult<PathBuf> {
+        if self.paused.load(Ordering::Relaxed) {
+            return Err(AppError::Capture("capture paused".to_string()));
+        }
+
+        let now = Utc::now();
+        let id = Uuid::new_v4().to_string();
+        let safe_label = normalized(label);
+        let date_dir = self.date_dir(now);
+        fs::create_dir_all(&date_dir)?;
+        let filename = date_dir.join(format!("snapshot_{}_{}.png", safe_label, id));
+
+        let (image, monitor_label) = self.capture_monitor_fallback()?;
+        let width = image.width();
+        let height = image.height();
+
+        if width == 0 || height == 0 {
+            return Err(AppError::Capture(format!(
+                "captured image has invalid dimensions: {}x{}",
+                width, height
+            )));
+        }
+
+        image
+            .save(&filename)
+            .map_err(|e| AppError::Capture(e.to_string()))?;
+
+        let record = CaptureRecord {
+            id: id.clone(),
+            ts: now,
+            window_title: Some(label.to_string()),
+            app_name: None,
+            event_type: "snapshot".to_string(),
+            path: filename.to_string_lossy().to_string(),
+            width: Some(width),
+            height: Some(height),
+            monitor: monitor_label,
+            hash: None,
+        };
+
+        self.db.insert_capture(&record)?;
+        if let Some(index) = &self.search {
+            let _ = index.add_capture(&record, None);
+        }
+
+        Ok(filename)
+    }
+
     /// Test function to verify capture is working
     pub fn test_capture(&self) -> AppResult<()> {
         println!("=== Testing capture functionality ===");
