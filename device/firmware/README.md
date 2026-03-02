@@ -21,6 +21,12 @@ west build -b veea-device /Users/kelvin/Veea/veea/device/firmware
 west flash
 ```
 
+## Monitor
+
+```sh
+west espressif monitor
+```
+
 ## Next steps
 
 - **Microphone**: add an I2S microphone node in a board overlay and enable
