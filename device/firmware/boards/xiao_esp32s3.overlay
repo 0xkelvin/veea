@@ -4,5 +4,5 @@
 };
 
 &lcd_cam_dvp {
-	cam-clk = <20000000>;
+	cam-clk = <6000000>;
 };

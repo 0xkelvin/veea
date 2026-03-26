@@ -237,7 +237,7 @@ static const uint8_t ov2640_default_regs[][2] = {
 	{0x91, 0xd7},
 	{0x91, 0xe8},
 	{0x91, 0x20},
-	{0xC2, 0x08 | 0x04 | 0x02}, /* CTRL0 - enable YUV422/YUV/RGB */
+	{0xC2, 0x0C}, /* CTRL0 - RGB565 mode */
 };
 
 /* JPEG output format – applied after video_set_format(JPEG)
@@ -254,15 +254,17 @@ static const uint8_t ov2640_jpeg_regs[][2] = {
 	{0x44, 0x10}, /* QS – JPEG quantization scale */
 };
 
-/* RGB565 output format – used as fallback when JPEG is not available */
+/* RGB565 output format – force OV2640 to output true RGB565 */
 static const uint8_t ov2640_rgb565_regs[][2] = {
 	{0xFF, 0x00}, /* BANK_SEL = DSP */
-	{0xDA, 0x08}, /* IMAGE_MODE – RGB565 */
+	{0xDA, 0x08}, /* IMAGE_MODE – RGB565 output */
 	{0xD7, 0x03},
 	{0xDF, 0x00},
 	{0x33, 0xa0},
 	{0x3C, 0x00},
 	{0xe1, 0x67},
+	{0xC2, 0x0C}, /* CTRL0 – RGB565 mode (not YUV) */
+	{0xE0, 0x00}, /* RESET – normal operation */
 };
 
 static int ov2640_init_sensor(const struct device *i2c)
@@ -561,18 +563,16 @@ static int stream_photo_ble(const uint8_t *data, size_t len)
  * SD card (numbered IMG%05u.JPG / IMG%05u.BMP).
  * ------------------------------------------------------------------*/
 static uint32_t image_counter;
+static bool camera_initialized;
 
 static int capture_and_route(void)
 {
 	const struct device *camera = DEVICE_DT_GET(DT_CHOSEN(zephyr_camera));
-	struct video_caps caps = { .type = VIDEO_BUF_TYPE_OUTPUT };
 	struct video_format fmt = { 0 };
 	struct video_buffer *dequeued = NULL;
 	struct video_buffer *buffers[CONFIG_VIDEO_BUFFER_POOL_NUM_MAX] = { 0 };
 	uint8_t buffer_count = 0;
-	uint32_t width = 640, height = 480; /* VGA – matches omiGlass target */
 	bool streaming = false;
-	bool use_jpeg = false;
 	int ret;
 
 	if (!device_is_ready(camera)) {
@@ -580,63 +580,35 @@ static int capture_and_route(void)
 		return -ENODEV;
 	}
 
-	if (!ov2640_detected()) {
-		printk("Camera not detected on I2C\n");
-		return -ENODEV;
-	}
-
-	/*
-	 * ov2640_detected() runs the sensor init which already includes a
-	 * 500 ms AEC wait; 200 ms here is enough for the Zephyr video driver
-	 * to finish its own initialisation before we query capabilities.
-	 */
-	k_sleep(K_MSEC(200));
-
-	ret = video_get_caps(camera, &caps);
-	if (ret != 0) {
-		printk("Camera caps failed (%d)\n", ret);
-		return ret;
-	}
-
-	/*
-	 * Prefer JPEG for best quality and smallest file size.
-	 * Fall back to the largest available RGB565 resolution.
-	 */
-	const struct video_format_cap *cap = caps.format_caps;
-	const struct video_format_cap *chosen = NULL;
-
-	while (cap && cap->pixelformat != 0) {
-		if (cap->pixelformat == VIDEO_PIX_FMT_JPEG) {
-			if (!use_jpeg || chosen == NULL) {
-				chosen   = cap;
-				use_jpeg = true;
-				width    = cap->width_min;
-				height   = cap->height_min;
-			}
-		} else if (cap->pixelformat == VIDEO_PIX_FMT_RGB565 && !use_jpeg) {
-			if (chosen == NULL ||
-			    cap->width_min > chosen->width_min) {
-				chosen = cap;
-				width  = cap->width_min;
-				height = cap->height_min;
-			}
+	/* Initialize camera sensor only once */
+	if (!camera_initialized) {
+		if (!ov2640_detected()) {
+			printk("Camera not detected on I2C\n");
+			return -ENODEV;
 		}
-		cap++;
+		camera_initialized = true;
+		k_sleep(K_MSEC(200));
 	}
 
-	if (chosen == NULL) {
-		printk("No supported camera format\n");
-		return -ENOTSUP;
-	}
+	/*
+	 * Force RGB565 – Zephyr ESP32-S3 DVP driver does not produce valid
+	 * JPEG output (bytesused is always 0).  We capture RGB565 and let
+	 * the mobile app convert to a displayable image.
+	 *
+	 * Use 320x240 (QVGA) as a good balance between quality and BLE
+	 * transfer time.  160x120 is too small; 640x480 is 600 KB which
+	 * takes ~60 s over BLE at 200 bytes/chunk.
+	 */
+	uint32_t width  = 320;
+	uint32_t height = 240;
 
-	printk("Capturing %s %ux%u...\n",
-	       use_jpeg ? "JPEG" : "RGB565", width, height);
+	printk("Capturing RGB565 %ux%u...\n", width, height);
 
 	fmt.type        = VIDEO_BUF_TYPE_OUTPUT;
-	fmt.pixelformat = chosen->pixelformat;
+	fmt.pixelformat = VIDEO_PIX_FMT_RGB565;
 	fmt.width       = width;
 	fmt.height      = height;
-	fmt.pitch       = 0;
+	fmt.pitch       = width * 2;
 
 	ret = video_set_format(camera, &fmt);
 	if (ret != 0) {
@@ -644,47 +616,28 @@ static int capture_and_route(void)
 		return ret;
 	}
 
-	/* Apply output-format OV2640 registers after video_set_format() so the
-	 * driver cannot overwrite our settings.
-	 */
+	/* Apply RGB565 OV2640 registers after video_set_format() */
 	if (ov2640_i2c_bus) {
-		const uint8_t (*regs)[2];
-		size_t count;
-
-		if (use_jpeg) {
-			regs  = ov2640_jpeg_regs;
-			count = ARRAY_SIZE(ov2640_jpeg_regs);
-		} else {
-			regs  = ov2640_rgb565_regs;
-			count = ARRAY_SIZE(ov2640_rgb565_regs);
-		}
-		for (size_t i = 0; i < count; i++) {
-			int reg_ret = ov2640_write_reg(ov2640_i2c_bus,
-						       regs[i][0], regs[i][1]);
-
-			if (reg_ret) {
-				printk("OV2640 fmt reg 0x%02x write failed (%d)\n",
-				       regs[i][0], reg_ret);
-			}
+		for (size_t i = 0; i < ARRAY_SIZE(ov2640_rgb565_regs); i++) {
+			ov2640_write_reg(ov2640_i2c_bus,
+					 ov2640_rgb565_regs[i][0],
+					 ov2640_rgb565_regs[i][1]);
 		}
 	}
 
+	/* Use actual format returned by driver */
 	width  = fmt.width;
 	height = fmt.height;
 
 	if (fmt.size == 0) {
-		/*
-		 * JPEG worst-case is well under width*height/2 for VGA at our
-		 * quality setting.  RGB565 is exactly width*height*2 bytes.
-		 */
-		fmt.size = use_jpeg ? (width * height / 2U)
-				    : (width * height * 2U);
+		fmt.size = width * height * 2U;
 	}
 
-	uint32_t pitch = fmt.pitch ? fmt.pitch
-				   : (use_jpeg ? 0U : fmt.width * 2U);
+	uint32_t pitch = fmt.pitch ? fmt.pitch : (width * 2U);
 
-	buffer_count = caps.min_vbuf_count ? caps.min_vbuf_count : 1U;
+	struct video_caps caps = { .type = VIDEO_BUF_TYPE_OUTPUT };
+	ret = video_get_caps(camera, &caps);
+	buffer_count = (ret == 0 && caps.min_vbuf_count) ? caps.min_vbuf_count : 1U;
 	if (buffer_count > ARRAY_SIZE(buffers)) {
 		buffer_count = ARRAY_SIZE(buffers);
 	}
@@ -708,7 +661,6 @@ static int capture_and_route(void)
 		memset(buffers[i], 0, sizeof(struct video_buffer));
 
 		uintptr_t da = (uintptr_t)(mem + sizeof(struct video_buffer));
-
 		da = (da + CONFIG_VIDEO_BUFFER_POOL_ALIGN - 1)
 		     & ~(uintptr_t)(CONFIG_VIDEO_BUFFER_POOL_ALIGN - 1);
 		buffers[i]->buffer = (uint8_t *)da;
@@ -729,11 +681,7 @@ static int capture_and_route(void)
 	}
 	streaming = true;
 
-	/*
-	 * Allow auto-exposure to settle before taking the picture.
-	 * 2 s gives the OV2640 AEC/AGC enough frames to converge in typical
-	 * indoor and outdoor lighting; 3 s (original) was unnecessarily long.
-	 */
+	/* Allow auto-exposure to settle */
 	printk("Waiting for AEC to settle...\n");
 	k_sleep(K_MSEC(2000));
 
@@ -747,37 +695,46 @@ static int capture_and_route(void)
 		goto cleanup;
 	}
 
-	/* For RGB565, refine pitch from actual bytes transferred */
-	if (!use_jpeg && dequeued->bytesused) {
-		uint32_t computed = dequeued->bytesused / fmt.height;
+	/* Validate we got actual data */
+	size_t img_len = dequeued->bytesused;
+	if (img_len == 0) {
+		/* bytesused=0 means driver didn't report size; use expected size */
+		img_len = width * height * 2U;
+		printk("Warning: bytesused=0, using expected size %u\n",
+		       (unsigned)img_len);
+	}
 
+	/* Refine pitch from actual bytes transferred */
+	if (dequeued->bytesused) {
+		uint32_t computed = dequeued->bytesused / height;
 		if (computed && computed != pitch) {
 			printk("Pitch adjusted %u -> %u\n", pitch, computed);
 			pitch = computed;
 		}
 	}
 
-	printk("Frame captured: %u bytes (%s %ux%u)\n",
-	       dequeued->bytesused,
-	       use_jpeg ? "JPEG" : "RGB565",
-	       fmt.width, fmt.height);
+	printk("Frame captured: %u bytes (RGB565 %ux%u)\n",
+	       (unsigned)img_len, width, height);
+
+	/* Log first 16 bytes for debugging */
+	printk("First 16 bytes:");
+	for (int i = 0; i < 16 && i < (int)img_len; i++) {
+		printk(" %02x", dequeued->buffer[i]);
+	}
+	printk("\n");
 
 	/* ---------------------------------------------------------------
 	 * Route: BLE when connected with notifications enabled,
 	 *        otherwise SD card.
 	 * ---------------------------------------------------------------*/
 	if (ble_connected && photo_notify_enabled) {
-		size_t img_len = dequeued->bytesused
-				 ? dequeued->bytesused : fmt.size;
-
 		printk("Streaming image over BLE...\n");
 		ret = stream_photo_ble(dequeued->buffer, img_len);
 	} else {
-		const char *ext  = use_jpeg ? "JPG" : "BMP";
 		char path[32];
 
-		snprintf(path, sizeof(path), DISK_MOUNT_PT "/IMG%05u.%s",
-			 (unsigned)image_counter, ext);
+		snprintf(path, sizeof(path), DISK_MOUNT_PT "/IMG%05u.BMP",
+			 (unsigned)image_counter);
 
 		ret = mount_sdcard();
 		if (ret != 0) {
@@ -787,7 +744,6 @@ static int capture_and_route(void)
 		}
 
 		struct fs_file_t file;
-
 		fs_file_t_init(&file);
 		ret = fs_open(&file, path, FS_O_CREATE | FS_O_WRITE | FS_O_TRUNC);
 		if (ret != 0) {
@@ -795,15 +751,8 @@ static int capture_and_route(void)
 			goto cleanup;
 		}
 
-		if (use_jpeg) {
-			size_t jpeg_len = dequeued->bytesused
-					  ? dequeued->bytesused : fmt.size;
-
-			ret = fs_write_all(&file, dequeued->buffer, jpeg_len);
-		} else {
-			ret = bmp_write_rgb565(&file, dequeued->buffer,
-					       fmt.width, fmt.height, pitch);
-		}
+		ret = bmp_write_rgb565(&file, dequeued->buffer,
+				       width, height, pitch);
 		fs_close(&file);
 
 		if (ret != 0) {
