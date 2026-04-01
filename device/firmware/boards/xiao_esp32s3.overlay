@@ -1,8 +1,0 @@
-/ {
-	model = "Veea Device";
-	compatible = "veea,device";
-};
-
-&lcd_cam_dvp {
-	cam-clk = <6000000>;
-};

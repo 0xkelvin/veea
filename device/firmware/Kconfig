@@ -1,0 +1,14 @@
+# Veea firmware Kconfig
+
+config I2S_ESP32_PDM_RX
+	bool "ESP32 I2S PDM RX mode on I2S0"
+	depends on I2S_ESP32
+	default n
+	help
+	  Enable PDM RX mode on I2S0 for PDM microphones (e.g. MSM261S4030H0R
+	  on Xiao ESP32-S3 Sense expansion board).
+	  ESP32-S3 only supports PDM-to-PCM converter on I2S0.
+	  When enabled, the patched i2s_esp32_pdm.c replaces the upstream
+	  Zephyr I2S driver for I2S0 to use PDM slot/clock configuration.
+
+source "Kconfig.zephyr"

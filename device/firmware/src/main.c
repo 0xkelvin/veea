@@ -14,6 +14,9 @@
 #include <zephyr/multi_heap/shared_multi_heap.h>
 #include <ff.h>
 
+#include "ble_audio_service.h"
+#include "mic_driver.h"
+
 /* ---- Storage ---- */
 #define DISK_DRIVE_NAME "SD"
 #define DISK_MOUNT_PT   "/SD:"
@@ -808,8 +811,27 @@ int main(void)
 	printk("Continuous capture every %d ms – BLE streams when connected, "
 	       "SD card otherwise\n", CAPTURE_INTERVAL_MS);
 
+	/* Initialise audio subsystem */
+	ble_audio_service_init();
+	int mic_err = mic_driver_init();
+	if (mic_err) {
+		printk("Mic driver init failed (%d) – audio disabled\n", mic_err);
+	} else {
+		printk("Audio subsystem ready\n");
+	}
+
 	while (true) {
+		/* Pause mic during camera capture to avoid DMA contention */
+		bool mic_was_running = mic_driver_is_running();
+		if (mic_was_running) {
+			mic_driver_stop();
+		}
+
 		int ret = capture_and_route();
+
+		if (mic_was_running) {
+			mic_driver_start();
+		}
 
 		if (ret != 0) {
 			printk("Capture error (%d), retrying next cycle\n", ret);

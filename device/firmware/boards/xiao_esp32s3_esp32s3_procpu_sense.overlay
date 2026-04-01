@@ -1,0 +1,45 @@
+/*
+ * Veea Device overlay for Xiao ESP32-S3 Sense
+ *
+ * I2S0 is used for the built-in PDM microphone.
+ * ESP32-S3 only supports PDM mode on I2S0 (not I2S1).
+ *
+ * Built-in PDM mic (MSM261S4030H0R) on Sense expansion board:
+ *   GPIO42 → PDM CLK  (I2S0 WS output)
+ *   GPIO41 → PDM DATA (I2S0 SD input)
+ *
+ * I2S0 and LCD_CAM share DMA resources, so mic is stopped during
+ * camera capture (handled in main.c).
+ */
+
+#include <zephyr/dt-bindings/pinctrl/esp-pinctrl-common.h>
+#include <zephyr/dt-bindings/pinctrl/esp32s3-pinctrl.h>
+#include <zephyr/dt-bindings/pinctrl/esp32s3-gpio-sigmap.h>
+
+/ {
+	model = "Veea Device";
+	compatible = "veea,device";
+};
+
+&pinctrl {
+	i2s0_default: i2s0_default {
+		group1 {
+			pinmux = <I2S0_I_WS_GPIO42>;
+			output-enable;
+		};
+		group2 {
+			pinmux = <I2S0_I_SD_GPIO41>;
+			input-enable;
+		};
+	};
+};
+
+&i2s0 {
+	status = "okay";
+	pinctrl-0 = <&i2s0_default>;
+	pinctrl-names = "default";
+};
+
+&lcd_cam_dvp {
+	cam-clk = <6000000>;
+};
